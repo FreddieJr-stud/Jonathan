@@ -15,24 +15,27 @@ use windows::Win32::UI::WindowsAndMessaging::{
     GetWindowThreadProcessId, SetForegroundWindow,
 };
 
-/// Unminimizes/shows the main window and forces it to the foreground,
+/// Unminimizes/shows the window `label` and forces it to the foreground,
 /// logging the outcome. Shared by the toast-activation path (toast.rs) and
 /// the global-hotkey fallback (lib.rs) that exists because toast activation
 /// can silently fail to fire at all -- see the comment on that hotkey.
-pub fn bring_main_window_forward(app: &tauri::AppHandle) {
-    match app.get_webview_window("main") {
-        Some(main) => {
-            let _ = main.unminimize();
-            let _ = main.show();
-            match main.hwnd() {
+/// Takes a label (not hardcoded "main") because a single-instance process can
+/// now host multiple project windows; callers resolve the target via
+/// `WindowRegistry::focused_or_main()`.
+pub fn bring_window_forward(app: &tauri::AppHandle, label: &str) {
+    match app.get_webview_window(label) {
+        Some(win) => {
+            let _ = win.unminimize();
+            let _ = win.show();
+            match win.hwnd() {
                 Ok(hwnd) => {
                     let ok = force_foreground(hwnd);
-                    log::info!("force_foreground succeeded: {ok}");
+                    log::info!("force_foreground succeeded: {ok} (window={label})");
                 }
-                Err(e) => log::warn!("main.hwnd() failed: {e:?}"),
+                Err(e) => log::warn!("{label}.hwnd() failed: {e:?}"),
             }
         }
-        None => log::warn!("bring_main_window_forward: no main window found"),
+        None => log::warn!("bring_window_forward: no window found for label={label}"),
     }
 }
 

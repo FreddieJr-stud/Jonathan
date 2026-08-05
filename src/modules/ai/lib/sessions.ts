@@ -1,5 +1,7 @@
 import type { UIMessage } from "@ai-sdk/react";
 import { LazyStore } from "@tauri-apps/plugin-store";
+import { getLaunchDir } from "@/lib/launchDir";
+import { storeSuffix } from "@/lib/storeScope";
 
 export type SessionMeta = {
   id: string;
@@ -8,12 +10,22 @@ export type SessionMeta = {
   updatedAt: number;
 };
 
-const STORE_PATH = "terax-ai-sessions.json";
 const KEY_SESSIONS = "sessions";
 const KEY_ACTIVE = "activeId";
 const messagesKey = (id: string) => `messages:${id}`;
 
-const store = new LazyStore(STORE_PATH, { defaults: {}, autoSave: 200 });
+// Lazy so the store file name can depend on getLaunchDir() -- see the same
+// comment in spaces/lib/store.ts. Keeps one project window's chat history
+// from showing up in another's now that a single-instance process can host
+// more than one project window.
+let store: LazyStore | null = null;
+function getStore(): LazyStore {
+  if (!store) {
+    const path = `terax-ai-sessions${storeSuffix(getLaunchDir())}.json`;
+    store = new LazyStore(path, { defaults: {}, autoSave: 200 });
+  }
+  return store;
+}
 
 export type LoadedSessions = {
   sessions: SessionMeta[];
@@ -24,7 +36,7 @@ export async function loadAll(): Promise<LoadedSessions> {
   // One IPC roundtrip via entries() rather than two parallel get()s. Per-
   // session messages are loaded lazily via `loadMessages` only when a
   // session is opened, so cold boot stays at a single store call.
-  const entries = await store.entries();
+  const entries = await getStore().entries();
   let sessions: SessionMeta[] | undefined;
   let activeId: string | null | undefined;
   for (const [k, v] of entries) {
@@ -35,26 +47,26 @@ export async function loadAll(): Promise<LoadedSessions> {
 }
 
 export async function loadMessages(id: string): Promise<UIMessage[] | null> {
-  return (await store.get<UIMessage[]>(messagesKey(id))) ?? null;
+  return (await getStore().get<UIMessage[]>(messagesKey(id))) ?? null;
 }
 
 export async function saveSessionsList(sessions: SessionMeta[]): Promise<void> {
-  await store.set(KEY_SESSIONS, sessions);
+  await getStore().set(KEY_SESSIONS, sessions);
 }
 
 export async function saveActiveId(id: string | null): Promise<void> {
-  await store.set(KEY_ACTIVE, id);
+  await getStore().set(KEY_ACTIVE, id);
 }
 
 export async function saveMessages(
   id: string,
   messages: UIMessage[],
 ): Promise<void> {
-  await store.set(messagesKey(id), messages);
+  await getStore().set(messagesKey(id), messages);
 }
 
 export async function deleteSessionData(id: string): Promise<void> {
-  await store.delete(messagesKey(id));
+  await getStore().delete(messagesKey(id));
 }
 
 export function newSessionId(): string {

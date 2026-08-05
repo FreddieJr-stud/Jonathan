@@ -19,6 +19,10 @@ use session::Session;
 
 pub struct PtyState {
     sessions: RwLock<HashMap<u32, Arc<Session>>>,
+    // Owning window's label per session id, so a window closing (or reloading
+    // its webview) in a multi-window single-instance process only reaps its
+    // own sessions, not every project window's.
+    owners: RwLock<HashMap<u32, String>>,
     // Starts at 1 so freshly-handed-out ids are never 0, which the frontend
     // sometimes treats as "unset". Increments monotonically; never reused.
     next_id: AtomicU32,
@@ -28,6 +32,7 @@ impl Default for PtyState {
     fn default() -> Self {
         Self {
             sessions: RwLock::new(HashMap::new()),
+            owners: RwLock::new(HashMap::new()),
             next_id: AtomicU32::new(1),
         }
     }
@@ -35,7 +40,43 @@ impl Default for PtyState {
 
 impl PtyState {
     pub(super) fn take(&self, id: u32) -> Option<Arc<Session>> {
+        self.owners.write().unwrap().remove(&id);
         self.sessions.write().unwrap().remove(&id)
+    }
+
+    /// Kills and drops every session owned by `label`. Used both by
+    /// `pty_close_all` (scoped to the calling window) and by the
+    /// window-Destroyed cleanup in lib.rs.
+    pub(crate) fn close_all_for_window(&self, label: &str) -> usize {
+        let ids: Vec<u32> = {
+            let owners = self.owners.read().unwrap();
+            owners
+                .iter()
+                .filter(|(_, l)| l.as_str() == label)
+                .map(|(id, _)| *id)
+                .collect()
+        };
+        let drained: Vec<(u32, Arc<Session>)> = {
+            let mut sessions = self.sessions.write().unwrap();
+            let mut owners = self.owners.write().unwrap();
+            ids.into_iter()
+                .filter_map(|id| {
+                    owners.remove(&id);
+                    sessions.remove(&id).map(|s| (id, s))
+                })
+                .collect()
+        };
+        let count = drained.len();
+        for (id, s) in drained {
+            if let Err(e) = s.killer.lock().unwrap().kill() {
+                log::debug!("close_all_for_window: kill id={id} returned {e}");
+            }
+            thread::Builder::new()
+                .name(format!("terax-pty-drop-{id}"))
+                .spawn(move || session::drop_session(s))
+                .expect("spawn pty drop thread");
+        }
+        count
     }
 }
 
@@ -43,6 +84,7 @@ impl PtyState {
 #[allow(clippy::too_many_arguments)]
 pub async fn pty_open(
     app: tauri::AppHandle,
+    window: tauri::Window,
     state: tauri::State<'_, PtyState>,
     registry: tauri::State<'_, WorkspaceRegistry>,
     cols: u16,
@@ -55,9 +97,13 @@ pub async fn pty_open(
     on_data: Channel<Response>,
     on_exit: Channel<i32>,
 ) -> Result<u32, String> {
+    let label = window.label().to_string();
     let workspace = WorkspaceEnv::from_option(workspace);
     let blocks = blocks.unwrap_or(false);
-    let cwd = user_spawn_cwd_or_home(&registry, cwd.as_deref(), &workspace);
+    let cwd = user_spawn_cwd_or_home(&registry, cwd.as_deref(), &workspace).or_else(|| {
+        crate::modules::workspace::launch_cwd_snapshot(&label)
+            .map(|p| p.to_string_lossy().into_owned())
+    });
     let id = state.next_id.fetch_add(1, Ordering::Relaxed);
     let session = tauri::async_runtime::spawn_blocking(move || {
         session::spawn(
@@ -75,6 +121,7 @@ pub async fn pty_open(
         e
     })?;
     state.sessions.write().unwrap().insert(id, session);
+    state.owners.write().unwrap().insert(id, label);
     // The shell can exit before this insert (instant failure, `exit` in an rc
     // file); the waiter's reap then ran with the id absent. Re-check and reap
     // so the pseudoconsole isn't stranded.
@@ -283,25 +330,17 @@ fn shell_has_children(shell_pid: u32) -> bool {
 }
 
 // A fresh webview load orphans the previous frontend's sessions in this still
-// running process; reap them on boot before any new tab spawns.
+// running process; reap them on boot before any new tab spawns. Scoped to the
+// calling window's own sessions -- in a multi-window single-instance process
+// this must not touch other project windows' sessions.
 #[tauri::command]
-pub fn pty_close_all(state: tauri::State<PtyState>) -> Result<usize, String> {
-    let drained: Vec<(u32, Arc<Session>)> = {
-        let mut sessions = state.sessions.write().unwrap();
-        sessions.drain().collect()
-    };
-    let count = drained.len();
-    for (id, s) in drained {
-        if let Err(e) = s.killer.lock().unwrap().kill() {
-            log::debug!("pty_close_all: kill id={id} returned {e}");
-        }
-        thread::Builder::new()
-            .name(format!("terax-pty-drop-{id}"))
-            .spawn(move || session::drop_session(s))
-            .expect("spawn pty drop thread");
-    }
+pub fn pty_close_all(state: tauri::State<PtyState>, window: tauri::Window) -> Result<usize, String> {
+    let count = state.close_all_for_window(window.label());
     if count > 0 {
-        log::info!("pty_close_all: reaped {count} orphaned session(s)");
+        log::info!(
+            "pty_close_all: reaped {count} orphaned session(s) for window={}",
+            window.label()
+        );
     }
     Ok(count)
 }

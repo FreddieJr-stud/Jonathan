@@ -1,4 +1,6 @@
 import { LazyStore } from "@tauri-apps/plugin-store";
+import { getLaunchDir } from "@/lib/launchDir";
+import { storeSuffix } from "@/lib/storeScope";
 import type { WorkspaceEnv } from "@/modules/workspace";
 import type { SerializedTab } from "./serialize";
 
@@ -18,13 +20,25 @@ export type SpaceState = {
   activeTabIndex: number;
 };
 
-const STORE_PATH = "terax-spaces.json";
 const KEY_SPACES = "spaces";
 const KEY_ACTIVE = "activeId";
 const STATE_PREFIX = "state:";
 const stateKey = (id: string) => `${STATE_PREFIX}${id}`;
 
-const store = new LazyStore(STORE_PATH, { defaults: {}, autoSave: 500 });
+// Lazy so the store file name can depend on getLaunchDir(), which is only
+// resolved once initLaunchDir() settles in main.tsx (before this module's
+// exports are ever called, but after module load). One process can now host
+// multiple project windows (single-instance); each window is its own webview
+// with its own JS module instance, so this per-window suffix is all that's
+// needed to keep their spaces from colliding on disk.
+let store: LazyStore | null = null;
+function getStore(): LazyStore {
+  if (!store) {
+    const path = `terax-spaces${storeSuffix(getLaunchDir())}.json`;
+    store = new LazyStore(path, { defaults: {}, autoSave: 500 });
+  }
+  return store;
+}
 
 export type LoadedSpaces = {
   spaces: SpaceMeta[];
@@ -33,7 +47,7 @@ export type LoadedSpaces = {
 };
 
 export async function loadAll(): Promise<LoadedSpaces> {
-  const entries = await store.entries();
+  const entries = await getStore().entries();
   let spaces: SpaceMeta[] = [];
   let activeId: string | null = null;
   const states = new Map<string, SpaceState>();
@@ -48,19 +62,19 @@ export async function loadAll(): Promise<LoadedSpaces> {
 }
 
 export async function saveSpacesList(spaces: SpaceMeta[]): Promise<void> {
-  await store.set(KEY_SPACES, spaces);
+  await getStore().set(KEY_SPACES, spaces);
 }
 
 export async function saveActiveId(id: string | null): Promise<void> {
-  await store.set(KEY_ACTIVE, id);
+  await getStore().set(KEY_ACTIVE, id);
 }
 
 export async function saveState(id: string, state: SpaceState): Promise<void> {
-  await store.set(stateKey(id), state);
+  await getStore().set(stateKey(id), state);
 }
 
 export async function deleteSpaceData(id: string): Promise<void> {
-  await store.delete(stateKey(id));
+  await getStore().delete(stateKey(id));
 }
 
 export function newSpaceId(): string {

@@ -132,8 +132,8 @@ pub fn user_spawn_cwd_or_home(
     }
 }
 
-pub fn bootstrap_registry(registry: &WorkspaceRegistry) {
-    let _ = registry.authorize(resolve_launch_dir());
+pub fn bootstrap_registry(registry: &WorkspaceRegistry, label: &str) {
+    let _ = registry.authorize(resolve_launch_dir(label));
     if let Some(home) = dirs::home_dir() {
         let _ = registry.authorize(home);
     }
@@ -153,19 +153,38 @@ pub async fn workspace_authorize(
 
 #[tauri::command]
 pub async fn workspace_current_dir(
+    window: tauri::Window,
     registry: tauri::State<'_, WorkspaceRegistry>,
 ) -> Result<String, String> {
-    let launch = resolve_launch_dir();
+    let launch = resolve_launch_dir(window.label());
     let canonical = registry.authorize(&launch).map_err(|e| e.to_string())?;
     Ok(crate::modules::fs::to_canon(&canonical))
 }
 
-// Snapshotted once at app startup so the live `current_dir()` drifting later
-// (file dialogs, plugin chdir) can't shift the value seen by IPC or spawn.
-static LAUNCH_CWD: OnceLock<Option<PathBuf>> = OnceLock::new();
+// Snapshotted per-window at window-creation so the live `current_dir()`
+// drifting later (file dialogs, plugin chdir) can't shift the value seen by
+// IPC or spawn -- and keyed by window label so a 2nd project window sharing
+// this process (single-instance) doesn't inherit the 1st window's directory.
+static LAUNCH_CWD: OnceLock<Mutex<HashMap<String, PathBuf>>> = OnceLock::new();
 
-pub fn init_launch_cwd(cli_dir: Option<&str>) {
-    LAUNCH_CWD.get_or_init(|| resolve_launch_cwd(cli_dir, std::env::current_dir().ok()));
+fn launch_cwd_map() -> &'static Mutex<HashMap<String, PathBuf>> {
+    LAUNCH_CWD.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn init_launch_cwd(label: &str, cli_dir: Option<&str>) {
+    if let Some(dir) = resolve_launch_cwd(cli_dir, std::env::current_dir().ok()) {
+        launch_cwd_map()
+            .lock()
+            .expect("LAUNCH_CWD mutex poisoned")
+            .insert(label.to_string(), dir);
+    }
+}
+
+pub fn clear_launch_cwd(label: &str) {
+    launch_cwd_map()
+        .lock()
+        .expect("LAUNCH_CWD mutex poisoned")
+        .remove(label);
 }
 
 fn resolve_launch_cwd(cli_dir: Option<&str>, env_cwd: Option<PathBuf>) -> Option<PathBuf> {
@@ -178,12 +197,16 @@ fn resolve_launch_cwd(cli_dir: Option<&str>, env_cwd: Option<PathBuf>) -> Option
     env_cwd.filter(|p| is_usable_launch_dir(p))
 }
 
-pub fn launch_cwd_snapshot() -> Option<PathBuf> {
-    LAUNCH_CWD.get().and_then(|o| o.clone())
+pub fn launch_cwd_snapshot(label: &str) -> Option<PathBuf> {
+    launch_cwd_map()
+        .lock()
+        .expect("LAUNCH_CWD mutex poisoned")
+        .get(label)
+        .cloned()
 }
 
-fn resolve_launch_dir() -> PathBuf {
-    if let Some(cwd) = launch_cwd_snapshot() {
+fn resolve_launch_dir(label: &str) -> PathBuf {
+    if let Some(cwd) = launch_cwd_snapshot(label) {
         return cwd;
     }
     if let Some(cwd) = std::env::current_dir()

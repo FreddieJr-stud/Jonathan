@@ -4,23 +4,96 @@ use modules::{
     agent, archive, download, fs, git, history, mirror, net, preview,
     preview_capture, pty, secrets, shell, snippet, tailscale, toast, workspace,
 };
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
-use tauri::{Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder};
+use tauri::{Emitter, Manager, State, WebviewUrl, WebviewWindowBuilder, WindowEvent};
 #[cfg(target_os = "macos")]
-use tauri::{PhysicalPosition, WindowEvent};
+use tauri::PhysicalPosition;
 use tauri_plugin_window_state::StateFlags;
 
-/// Drained on first read so HMR / re-mounts can't replay the launch dir.
+/// Drained on first read (per window) so HMR / re-mounts can't replay the
+/// launch dir, and so a 2nd project window sharing this process (single
+/// instance) doesn't get handed the 1st window's directory.
 #[derive(Default)]
-struct LaunchDir(Mutex<Option<String>>);
+struct LaunchDir(Mutex<HashMap<String, String>>);
 
 #[tauri::command]
-fn get_launch_dir(state: State<'_, LaunchDir>) -> Option<String> {
-    state.0.lock().expect("LaunchDir mutex poisoned").take()
+fn get_launch_dir(window: tauri::Window, state: State<'_, LaunchDir>) -> Option<String> {
+    state
+        .0
+        .lock()
+        .expect("LaunchDir mutex poisoned")
+        .remove(window.label())
 }
 
-fn parse_launch_dir() -> Option<String> {
-    for arg in std::env::args().skip(1) {
+/// Tracks the open project windows in this (now single-instance) process:
+/// which canonical directory maps to which window label, so relaunching an
+/// already-open project focuses it instead of opening a duplicate, and which
+/// window was last focused, so the bring-forward hotkey/toast/Settings have
+/// something other than a hardcoded "main" to target.
+pub(crate) struct WindowRegistry {
+    by_dir: Mutex<HashMap<PathBuf, String>>,
+    last_focused: Mutex<Option<String>>,
+    next_index: AtomicU32,
+}
+
+impl Default for WindowRegistry {
+    fn default() -> Self {
+        Self {
+            by_dir: Mutex::new(HashMap::new()),
+            last_focused: Mutex::new(None),
+            // Starts at 2 -- "main" is window #1 in spirit, even though it
+            // isn't tracked by index.
+            next_index: AtomicU32::new(2),
+        }
+    }
+}
+
+impl WindowRegistry {
+    pub(crate) fn next_label(&self) -> String {
+        format!("project-{}", self.next_index.fetch_add(1, Ordering::Relaxed))
+    }
+
+    fn register(&self, dir: Option<&str>, label: &str) {
+        if let Some(canon) = dir.and_then(|d| std::fs::canonicalize(d).ok()) {
+            self.by_dir.lock().unwrap().insert(canon, label.to_string());
+        }
+    }
+
+    fn unregister(&self, label: &str) {
+        self.by_dir.lock().unwrap().retain(|_, l| l != label);
+        let mut last = self.last_focused.lock().unwrap();
+        if last.as_deref() == Some(label) {
+            *last = None;
+        }
+    }
+
+    pub(crate) fn label_for_dir(&self, dir: &str) -> Option<String> {
+        std::fs::canonicalize(dir)
+            .ok()
+            .and_then(|canon| self.by_dir.lock().unwrap().get(&canon).cloned())
+    }
+
+    fn set_focused(&self, label: &str) {
+        *self.last_focused.lock().unwrap() = Some(label.to_string());
+    }
+
+    /// Last-focused project window's label, falling back to "main" before
+    /// any Focused event has fired yet (e.g. hotkey pressed immediately at
+    /// startup).
+    pub(crate) fn focused_or_main(&self) -> String {
+        self.last_focused
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| "main".to_string())
+    }
+}
+
+fn parse_launch_dir_from(args: impl IntoIterator<Item = String>) -> Option<String> {
+    for arg in args {
         if arg.starts_with('-') {
             continue;
         }
@@ -33,6 +106,105 @@ fn parse_launch_dir() -> Option<String> {
         return Some(crate::modules::fs::to_canon(&canon));
     }
     None
+}
+
+fn parse_launch_dir() -> Option<String> {
+    parse_launch_dir_from(std::env::args().skip(1))
+}
+
+/// Creates a new project window (the initial "main" one at startup, or an
+/// additional one when the single-instance plugin routes a 2nd launch into
+/// this process instead of spawning a new Jonathan.exe). Every per-window
+/// piece of state (launch cwd, workspace registry authorization, the
+/// dir->label registry, the LaunchDir handoff to the frontend) is wired up
+/// here so both call sites stay in sync.
+fn create_project_window(
+    app: &tauri::AppHandle,
+    label: &str,
+    launch_dir: Option<String>,
+) -> tauri::Result<tauri::WebviewWindow> {
+    workspace::init_launch_cwd(label, launch_dir.as_deref());
+    workspace::bootstrap_registry(&app.state::<workspace::WorkspaceRegistry>(), label);
+    app.state::<WindowRegistry>().register(launch_dir.as_deref(), label);
+    if let Some(dir) = launch_dir {
+        app.state::<LaunchDir>()
+            .0
+            .lock()
+            .expect("LaunchDir mutex poisoned")
+            .insert(label.to_string(), dir);
+    }
+
+    let mut builder = WebviewWindowBuilder::new(app, label, WebviewUrl::App("index.html".into()))
+        .title("Jonathan")
+        .inner_size(800.0, 600.0)
+        .min_inner_size(420.0, 280.0)
+        .resizable(true)
+        .visible(false)
+        .additional_browser_args(
+            "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --disable-pinch",
+        );
+
+    #[cfg(target_os = "macos")]
+    {
+        builder = builder
+            .hidden_title(true)
+            .title_bar_style(tauri::TitleBarStyle::Overlay);
+    }
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    {
+        builder = builder.decorations(false).shadow(false).transparent(true);
+    }
+
+    let window = builder.build()?;
+
+    // With the "unstable" cargo feature (required for multi-webview panes),
+    // tauri-runtime-wry creates each window's primary webview as
+    // WebviewKind::WindowChild instead of WindowContent, and its
+    // undecorated-resize border hit-test (TAURI_DRAG_RESIZE_WINDOW) is only
+    // auto-attached at creation for WindowContent. Toggling set_resizable
+    // independently triggers that same attach as a side effect, regardless
+    // of webview kind.
+    #[cfg(windows)]
+    let _ = window.set_resizable(true);
+
+    {
+        let handle = app.clone();
+        let label = label.to_string();
+        window.on_window_event(move |event| {
+            if let WindowEvent::Focused(true) = event {
+                handle.state::<WindowRegistry>().set_focused(&label);
+            }
+            if matches!(event, WindowEvent::Destroyed) {
+                handle.state::<WindowRegistry>().unregister(&label);
+                let reaped_pty = handle.state::<pty::PtyState>().close_all_for_window(&label);
+                if reaped_pty > 0 {
+                    log::info!("window {label} closed: reaped {reaped_pty} pty session(s)");
+                }
+                let reaped_shell = handle.state::<shell::ShellState>().close_all_for_window(&label);
+                if reaped_shell > 0 {
+                    log::info!(
+                        "window {label} closed: reaped {reaped_shell} shell session/bg proc(s)"
+                    );
+                }
+                workspace::clear_launch_cwd(&label);
+            }
+            // macOS skips parent() for the settings window (see
+            // open_settings_window), so tie its lifecycle to whichever
+            // project window closes here instead. Other platforms use
+            // parent() directly.
+            #[cfg(target_os = "macos")]
+            if matches!(
+                event,
+                WindowEvent::CloseRequested { .. } | WindowEvent::Destroyed
+            ) {
+                if let Some(settings) = handle.get_webview_window("settings") {
+                    let _ = settings.close();
+                }
+            }
+        });
+    }
+
+    Ok(window)
 }
 
 #[tauri::command]
@@ -64,14 +236,19 @@ async fn open_settings_window(app: tauri::AppHandle, tab: Option<String>) -> Res
         // when the user clicks back into the editor or terminal (#33).
         .always_on_top(true);
 
-    // Tie lifecycle to the main window so settings minimizes/closes with it.
+    // Tie lifecycle to the last-focused project window (not a hardcoded
+    // "main" — a single-instance process can host more than one project
+    // window) so settings minimizes/closes with whichever project is active.
     // macOS: skip parent() — child + always_on_top leaves the settings webview
     // behind the main window except while the parent is being dragged (#33).
     #[cfg(not(target_os = "macos"))]
-    let builder = if let Some(main) = app.get_webview_window("main") {
-        builder.parent(&main).map_err(|e| e.to_string())?
-    } else {
-        builder
+    let builder = {
+        let label = app.state::<WindowRegistry>().focused_or_main();
+        if let Some(owner) = app.get_webview_window(&label) {
+            builder.parent(&owner).map_err(|e| e.to_string())?
+        } else {
+            builder
+        }
     };
 
     #[cfg(target_os = "macos")]
@@ -94,7 +271,10 @@ async fn open_settings_window(app: tauri::AppHandle, tab: Option<String>) -> Res
     }
 
     #[cfg(target_os = "macos")]
-    if let Some(main) = app.get_webview_window("main") {
+    if let Some(main) = {
+        let label = app.state::<WindowRegistry>().focused_or_main();
+        app.get_webview_window(&label)
+    } {
         if let (Ok(main_pos), Ok(main_size), Ok(settings_size)) = (
             main.outer_position(),
             main.outer_size(),
@@ -116,9 +296,50 @@ async fn open_settings_window(app: tauri::AppHandle, tab: Option<String>) -> Res
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let cli_dir = parse_launch_dir();
-    workspace::init_launch_cwd(cli_dir.as_deref());
 
     tauri::Builder::default()
+        // Must be the very first plugin registered (its own requirement --
+        // it sets up a named mutex/pipe very early, especially on Windows)
+        // so opening a 2nd project folder routes into this process as a new
+        // window instead of spawning a whole new Jonathan.exe -- which is
+        // what made the bring-forward hotkey unreliable to begin with: two
+        // processes both trying to own the same OS-level hotkey.
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            let win_registry = app.state::<WindowRegistry>();
+            let dir = parse_launch_dir_from(argv.into_iter().skip(1));
+
+            if let Some(existing_label) = dir.as_deref().and_then(|d| win_registry.label_for_dir(d)) {
+                #[cfg(windows)]
+                modules::win32_focus::bring_window_forward(app, &existing_label);
+                #[cfg(not(windows))]
+                if let Some(win) = app.get_webview_window(&existing_label) {
+                    let _ = win.unminimize();
+                    let _ = win.show();
+                    let _ = win.set_focus();
+                }
+                return;
+            }
+
+            match dir {
+                Some(dir) => {
+                    let label = win_registry.next_label();
+                    if let Err(e) = create_project_window(app, &label, Some(dir)) {
+                        log::warn!("single-instance: failed to open project window: {e:?}");
+                    }
+                }
+                None => {
+                    let label = win_registry.focused_or_main();
+                    #[cfg(windows)]
+                    modules::win32_focus::bring_window_forward(app, &label);
+                    #[cfg(not(windows))]
+                    if let Some(win) = app.get_webview_window(&label) {
+                        let _ = win.unminimize();
+                        let _ = win.show();
+                        let _ = win.set_focus();
+                    }
+                }
+            }
+        }))
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         // Skip restoring VISIBLE — frontend calls window.show() after first
@@ -152,101 +373,6 @@ pub fn run() {
                 .build(),
         )
         .plugin(tauri_plugin_opener::init())
-        .setup(|_app| {
-            // Created here (imperative Rust) instead of tauri.conf.json's
-            // declarative "windows" array, matching the settings/snippet
-            // pattern. (The real root cause of the resize/taskbar bug turned
-            // out to be stale "fullscreen": true window-state restoration,
-            // not the creation path -- see StateFlags::FULLSCREEN exclusion
-            // above -- but this imperative form is kept since it mirrors the
-            // rest of the window-creation code in this file.)
-            let mut main_builder = WebviewWindowBuilder::new(
-                _app,
-                "main",
-                WebviewUrl::App("index.html".into()),
-            )
-            .title("Jonathan")
-            .inner_size(800.0, 600.0)
-            .min_inner_size(420.0, 280.0)
-            .resizable(true)
-            .visible(false)
-            .additional_browser_args(
-                "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --disable-pinch",
-            );
-
-            #[cfg(target_os = "macos")]
-            {
-                main_builder = main_builder
-                    .hidden_title(true)
-                    .title_bar_style(tauri::TitleBarStyle::Overlay);
-            }
-            #[cfg(any(target_os = "linux", target_os = "windows"))]
-            {
-                main_builder = main_builder
-                    .decorations(false)
-                    .shadow(false)
-                    .transparent(true);
-            }
-
-            let main_window = main_builder.build()?;
-
-            // With the "unstable" cargo feature (required for multi-webview
-            // panes), tauri-runtime-wry creates each window's primary webview
-            // as WebviewKind::WindowChild instead of WindowContent, and its
-            // undecorated-resize border hit-test (TAURI_DRAG_RESIZE_WINDOW)
-            // is only auto-attached at creation for WindowContent. Toggling
-            // set_resizable independently triggers that same attach as a
-            // side effect, regardless of webview kind.
-            #[cfg(windows)]
-            let _ = main_window.set_resizable(true);
-
-            // macOS skips parent() for the settings window, so tie its lifecycle
-            // to the main window here instead. Other platforms keep parent().
-            #[cfg(target_os = "macos")]
-            if let Some(main) = _app.get_webview_window("main") {
-                let handle = _app.handle().clone();
-                main.on_window_event(move |event| {
-                    if matches!(
-                        event,
-                        WindowEvent::CloseRequested { .. } | WindowEvent::Destroyed
-                    ) {
-                        if let Some(settings) = handle.get_webview_window("settings") {
-                            let _ = settings.close();
-                        }
-                    }
-                });
-            }
-            // Expire staged downloads left over from previous sessions, then
-            // keep sweeping hourly for as long as the app runs.
-            modules::download::spawn_sweeper(_app.handle().clone());
-
-            // Backup path to bring Jonathan forward when toast-click
-            // activation silently fails to fire (observed: no callback at
-            // all, unrelated to the app that was focused -- see
-            // win32_focus.rs for the click path this bypasses entirely).
-            {
-                use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
-                let handle = _app.handle().clone();
-                if let Err(e) = _app
-                    .global_shortcut()
-                    .on_shortcut("ctrl+alt+shift+j", move |_app, _shortcut, event| {
-                        if event.state == ShortcutState::Pressed {
-                            #[cfg(windows)]
-                            modules::win32_focus::bring_main_window_forward(&handle);
-                            #[cfg(not(windows))]
-                            if let Some(main) = handle.get_webview_window("main") {
-                                let _ = main.unminimize();
-                                let _ = main.show();
-                                let _ = main.set_focus();
-                            }
-                        }
-                    })
-                {
-                    log::warn!("failed to register bring-forward global shortcut: {e:?}");
-                }
-            }
-            Ok(())
-        })
         .manage(pty::PtyState::default())
         .manage(preview::PreviewState::default())
         .manage(preview::PreviewKeys::default())
@@ -257,15 +383,57 @@ pub fn run() {
         .manage(fs::grep::ContentSearchState::default())
         .manage(mirror::MirrorState::default())
         .manage(snippet::SnippetState::default())
-        .manage({
-            let registry = workspace::WorkspaceRegistry::default();
-            workspace::bootstrap_registry(&registry);
-            if let Some(ref launch_dir) = cli_dir {
-                let _ = registry.authorize(launch_dir);
+        .manage(workspace::WorkspaceRegistry::default())
+        .manage(LaunchDir::default())
+        .manage(WindowRegistry::default())
+        .setup(move |_app| {
+            // Created here (imperative Rust) instead of tauri.conf.json's
+            // declarative "windows" array, matching the settings/snippet
+            // pattern. (The real root cause of the resize/taskbar bug turned
+            // out to be stale "fullscreen": true window-state restoration,
+            // not the creation path -- see StateFlags::FULLSCREEN exclusion
+            // above -- but this imperative form is kept since it mirrors the
+            // rest of the window-creation code in this file.) Shared with the
+            // single-instance plugin's 2nd-launch path -- see
+            // create_project_window.
+            create_project_window(_app.handle(), "main", cli_dir)?;
+
+            // Expire staged downloads left over from previous sessions, then
+            // keep sweeping hourly for as long as the app runs. Runs once for
+            // the whole process (not per project window) now that a
+            // single-instance process can host more than one.
+            modules::download::spawn_sweeper(_app.handle().clone());
+
+            // Backup path to bring Jonathan forward when toast-click
+            // activation silently fails to fire (observed: no callback at
+            // all, unrelated to the app that was focused -- see
+            // win32_focus.rs for the click path this bypasses entirely).
+            // Targets the last-focused project window, not a hardcoded
+            // "main" -- a single-instance process can host more than one.
+            {
+                use tauri_plugin_global_shortcut::{GlobalShortcutExt, ShortcutState};
+                let handle = _app.handle().clone();
+                if let Err(e) = _app
+                    .global_shortcut()
+                    .on_shortcut("ctrl+alt+shift+j", move |_app, _shortcut, event| {
+                        if event.state == ShortcutState::Pressed {
+                            let label = handle.state::<WindowRegistry>().focused_or_main();
+                            #[cfg(windows)]
+                            modules::win32_focus::bring_window_forward(&handle, &label);
+                            #[cfg(not(windows))]
+                            if let Some(win) = handle.get_webview_window(&label) {
+                                let _ = win.unminimize();
+                                let _ = win.show();
+                                let _ = win.set_focus();
+                            }
+                        }
+                    })
+                {
+                    log::warn!("failed to register bring-forward global shortcut: {e:?}");
+                }
             }
-            registry
+            Ok(())
         })
-        .manage(LaunchDir(Mutex::new(cli_dir)))
         .invoke_handler(tauri::generate_handler![
             pty::pty_open,
             pty::pty_write,

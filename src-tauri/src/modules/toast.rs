@@ -7,7 +7,7 @@
 // needing to block a thread to keep anything alive.
 #[cfg(windows)]
 mod imp {
-    use tauri::{AppHandle, Emitter};
+    use tauri::{AppHandle, Emitter, Manager};
     use winrt_toast::{Text, Toast, ToastManager};
 
     // Must match `identifier` in tauri.conf.json -- that's the AUMID the
@@ -32,14 +32,18 @@ mod imp {
                         // Clicking a toast does not foreground a hidden or
                         // minimized window on Windows, so the in-app nav that
                         // ACTIVATED_EVENT triggers would happen invisibly.
-                        // Bring the main window forward first. set_focus()
+                        // Bring the target window forward first. set_focus()
                         // alone relies on a one-shot foreground-lock exemption
                         // that toast activation grants us, which can get
                         // silently invalidated by an intermediate foreground
                         // change before we act on it -- more likely with
                         // multi-process apps (browsers) than a single-process
                         // game. force_foreground() bypasses the lock directly.
-                        crate::modules::win32_focus::bring_main_window_forward(&app);
+                        // Targets the last-focused project window, not a
+                        // hardcoded "main" -- a single-instance process can
+                        // host more than one project window.
+                        let label = app.state::<crate::WindowRegistry>().focused_or_main();
+                        crate::modules::win32_focus::bring_window_forward(&app, &label);
                         let _ = app.emit(ACTIVATED_EVENT, arg);
                     }
                 })),

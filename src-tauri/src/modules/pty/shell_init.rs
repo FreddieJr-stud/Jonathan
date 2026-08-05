@@ -188,10 +188,12 @@ fn apply_common(cmd: &mut CommandBuilder, cwd: Option<String>, blocks: bool) {
     }
     ensure_utf8_locale(cmd);
 
+    // The per-window launch-dir fallback (when the caller passed no cwd at
+    // all) is resolved upstream in pty_open, where the owning window's label
+    // is available -- this function only sees the final resolved cwd.
     let resolved_cwd = cwd
         .map(PathBuf::from)
         .filter(|p| p.is_dir())
-        .or_else(|| workspace::launch_cwd_snapshot().filter(|p| p.is_dir()))
         .or_else(|| dirs::home_dir().filter(|p| p.is_dir()));
     if let Some(cwd) = resolved_cwd {
         #[cfg(windows)]

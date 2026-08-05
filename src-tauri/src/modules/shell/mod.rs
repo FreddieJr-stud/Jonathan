@@ -153,6 +153,11 @@ fn run_blocking(
 pub struct ShellState {
     sessions: RwLock<HashMap<u32, Arc<ShellSession>>>,
     bg: RwLock<HashMap<u32, Arc<BackgroundProc>>>,
+    // Owning window's label per session/bg-handle id, so a project window
+    // closing in a multi-window single-instance process only reaps its own
+    // shell sessions and background processes, not every window's.
+    session_owners: RwLock<HashMap<u32, String>>,
+    bg_owners: RwLock<HashMap<u32, String>>,
     next_session_id: AtomicU32,
     next_bg_id: AtomicU32,
 }
@@ -162,14 +167,63 @@ impl Default for ShellState {
         Self {
             sessions: RwLock::new(HashMap::new()),
             bg: RwLock::new(HashMap::new()),
+            session_owners: RwLock::new(HashMap::new()),
+            bg_owners: RwLock::new(HashMap::new()),
             next_session_id: AtomicU32::new(1),
             next_bg_id: AtomicU32::new(1),
         }
     }
 }
 
+impl ShellState {
+    /// Kills and drops every session/background-process owned by `label`.
+    /// Called from the window-Destroyed cleanup in lib.rs.
+    pub(crate) fn close_all_for_window(&self, label: &str) -> usize {
+        let session_ids: Vec<u32> = {
+            let owners = self.session_owners.read().unwrap();
+            owners
+                .iter()
+                .filter(|(_, l)| l.as_str() == label)
+                .map(|(id, _)| *id)
+                .collect()
+        };
+        {
+            let mut sessions = self.sessions.write().unwrap();
+            let mut owners = self.session_owners.write().unwrap();
+            for id in &session_ids {
+                owners.remove(id);
+                sessions.remove(id);
+            }
+        }
+        let bg_ids: Vec<u32> = {
+            let owners = self.bg_owners.read().unwrap();
+            owners
+                .iter()
+                .filter(|(_, l)| l.as_str() == label)
+                .map(|(id, _)| *id)
+                .collect()
+        };
+        let bg_drained: Vec<Arc<BackgroundProc>> = {
+            let mut bg = self.bg.write().unwrap();
+            let mut owners = self.bg_owners.write().unwrap();
+            bg_ids
+                .iter()
+                .filter_map(|id| {
+                    owners.remove(id);
+                    bg.remove(id)
+                })
+                .collect()
+        };
+        for proc in &bg_drained {
+            proc.kill();
+        }
+        session_ids.len() + bg_drained.len()
+    }
+}
+
 #[tauri::command]
 pub fn shell_session_open(
+    window: tauri::Window,
     state: tauri::State<ShellState>,
     registry: tauri::State<WorkspaceRegistry>,
     cwd: Option<String>,
@@ -190,6 +244,11 @@ pub fn shell_session_open(
     let session = Arc::new(ShellSession::new(initial, workspace));
     let id = state.next_session_id.fetch_add(1, Ordering::Relaxed);
     state.sessions.write().unwrap().insert(id, session);
+    state
+        .session_owners
+        .write()
+        .unwrap()
+        .insert(id, window.label().to_string());
     Ok(id)
 }
 
@@ -227,11 +286,13 @@ pub async fn shell_session_run(
 #[tauri::command]
 pub fn shell_session_close(state: tauri::State<ShellState>, id: u32) -> Result<(), String> {
     state.sessions.write().unwrap().remove(&id);
+    state.session_owners.write().unwrap().remove(&id);
     Ok(())
 }
 
 #[tauri::command]
 pub fn shell_bg_spawn(
+    window: tauri::Window,
     state: tauri::State<ShellState>,
     registry: tauri::State<WorkspaceRegistry>,
     command: String,
@@ -243,6 +304,11 @@ pub fn shell_bg_spawn(
     let proc = background::spawn(command, cwd, workspace)?;
     let id = state.next_bg_id.fetch_add(1, Ordering::Relaxed);
     state.bg.write().unwrap().insert(id, proc);
+    state
+        .bg_owners
+        .write()
+        .unwrap()
+        .insert(id, window.label().to_string());
     Ok(id)
 }
 

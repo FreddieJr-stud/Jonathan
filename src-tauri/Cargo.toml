@@ -110,6 +110,7 @@ tauri-plugin-autostart = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-window-state = "2"
 tauri-plugin-global-shortcut = "2"
+tauri-plugin-single-instance = "2"
 
 [patch.crates-io]
 # Vendored tao 0.35.3 with one fix: KEY_EVENT_BUILDERS.lock() -> try_lock()
