@@ -18,6 +18,8 @@ const messagesKey = (id: string) => `messages:${id}`;
 // comment in spaces/lib/store.ts. Keeps one project window's chat history
 // from showing up in another's now that a single-instance process can host
 // more than one project window.
+const LEGACY_STORE_PATH = "terax-ai-sessions.json";
+
 let store: LazyStore | null = null;
 function getStore(): LazyStore {
   if (!store) {
@@ -27,16 +29,20 @@ function getStore(): LazyStore {
   return store;
 }
 
+let legacyStore: LazyStore | null = null;
+function getLegacyStore(): LazyStore {
+  if (!legacyStore) {
+    legacyStore = new LazyStore(LEGACY_STORE_PATH, { defaults: {}, autoSave: 200 });
+  }
+  return legacyStore;
+}
+
 export type LoadedSessions = {
   sessions: SessionMeta[];
   activeId: string | null;
 };
 
-export async function loadAll(): Promise<LoadedSessions> {
-  // One IPC roundtrip via entries() rather than two parallel get()s. Per-
-  // session messages are loaded lazily via `loadMessages` only when a
-  // session is opened, so cold boot stays at a single store call.
-  const entries = await getStore().entries();
+function readSessionsList(entries: [string, unknown][]): LoadedSessions {
   let sessions: SessionMeta[] | undefined;
   let activeId: string | null | undefined;
   for (const [k, v] of entries) {
@@ -44,6 +50,29 @@ export async function loadAll(): Promise<LoadedSessions> {
     else if (k === KEY_ACTIVE) activeId = v as string | null;
   }
   return { sessions: sessions ?? [], activeId: activeId ?? null };
+}
+
+export async function loadAll(): Promise<LoadedSessions> {
+  // One IPC roundtrip via entries() rather than two parallel get()s. Per-
+  // session messages are loaded lazily via `loadMessages` only when a
+  // session is opened, so cold boot stays at a single store call.
+  const primary = readSessionsList(await getStore().entries());
+  if (primary.sessions.length > 0 || !storeSuffix(getLaunchDir())) return primary;
+
+  // Fresh per-window store with nothing in it yet: before per-window
+  // scoping existed, every window shared this one unsuffixed file. Migrate
+  // it in once (sessions list, activeId, and every messages:<id> blob) so
+  // upgrading users don't see their chat history vanish. Legacy file is
+  // left in place (not deleted) as a safety net.
+  const legacyEntries = await getLegacyStore().entries();
+  const legacy = readSessionsList(legacyEntries);
+  if (legacy.sessions.length === 0) return primary;
+
+  const target = getStore();
+  for (const [k, v] of legacyEntries) {
+    await target.set(k, v);
+  }
+  return legacy;
 }
 
 export async function loadMessages(id: string): Promise<UIMessage[] | null> {

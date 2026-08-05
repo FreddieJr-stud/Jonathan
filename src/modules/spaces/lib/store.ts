@@ -31,6 +31,8 @@ const stateKey = (id: string) => `${STATE_PREFIX}${id}`;
 // multiple project windows (single-instance); each window is its own webview
 // with its own JS module instance, so this per-window suffix is all that's
 // needed to keep their spaces from colliding on disk.
+const LEGACY_STORE_PATH = "terax-spaces.json";
+
 let store: LazyStore | null = null;
 function getStore(): LazyStore {
   if (!store) {
@@ -40,14 +42,22 @@ function getStore(): LazyStore {
   return store;
 }
 
+let legacyStore: LazyStore | null = null;
+function getLegacyStore(): LazyStore {
+  if (!legacyStore) {
+    legacyStore = new LazyStore(LEGACY_STORE_PATH, { defaults: {}, autoSave: 500 });
+  }
+  return legacyStore;
+}
+
 export type LoadedSpaces = {
   spaces: SpaceMeta[];
   activeId: string | null;
   states: Map<string, SpaceState>;
 };
 
-export async function loadAll(): Promise<LoadedSpaces> {
-  const entries = await getStore().entries();
+async function readEntries(s: LazyStore): Promise<LoadedSpaces> {
+  const entries = await s.entries();
   let spaces: SpaceMeta[] = [];
   let activeId: string | null = null;
   const states = new Map<string, SpaceState>();
@@ -59,6 +69,23 @@ export async function loadAll(): Promise<LoadedSpaces> {
     }
   }
   return { spaces, activeId, states };
+}
+
+export async function loadAll(): Promise<LoadedSpaces> {
+  const primary = await readEntries(getStore());
+  if (primary.spaces.length > 0 || !storeSuffix(getLaunchDir())) return primary;
+
+  // Fresh per-window store with nothing in it yet: before per-window
+  // scoping existed, every window shared this one unsuffixed file. Migrate
+  // it in once so upgrading users don't see their spaces vanish. Legacy
+  // file is left in place (not deleted) as a safety net.
+  const legacy = await readEntries(getLegacyStore());
+  if (legacy.spaces.length === 0) return primary;
+
+  await saveSpacesList(legacy.spaces);
+  if (legacy.activeId) await saveActiveId(legacy.activeId);
+  for (const [id, state] of legacy.states) await saveState(id, state);
+  return legacy;
 }
 
 export async function saveSpacesList(spaces: SpaceMeta[]): Promise<void> {
