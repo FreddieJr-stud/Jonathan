@@ -1,0 +1,20 @@
+pub mod agent;
+pub mod archive;
+pub mod download;
+pub mod fs;
+pub mod git;
+pub mod history;
+pub mod mirror;
+pub mod net;
+pub mod preview;
+pub mod preview_capture;
+pub mod proc;
+pub mod pty;
+pub mod secrets;
+pub mod shell;
+pub mod snippet;
+pub mod tailscale;
+pub mod toast;
+#[cfg(windows)]
+pub mod win32_focus;
+pub mod workspace;

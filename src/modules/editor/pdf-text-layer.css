@@ -1,0 +1,112 @@
+/* PDF.js v6 text-layer styles. The text layer is an invisible, pixel-aligned
+ * overlay of real <span>s above each page canvas — it is what makes the
+ * rendered PDF *selectable*, so the app-wide copy-on-select (useCopyOnSelect,
+ * mounted on document) mirrors the highlight to the clipboard exactly as it
+ * does for the editor and rendered markdown.
+ *
+ * IMPORTANT: v6 positions/sizes each span from CSS custom properties — the
+ * container's `--total-scale-factor` plus per-span `--font-height`/`--scale-x`/
+ * `--rotate` that TextLayer.render() writes inline. The font-size/transform
+ * rules below are mandatory; without them spans collapse to zero area and
+ * nothing can be selected. Adapted from pdfjs-dist/web/pdf_viewer.css. */
+.pdf-view {
+  height: 100%;
+  width: 100%;
+  overflow: auto;
+  padding: 12px;
+}
+
+/* Inner wrapper holding the page column. During a ctrl/pinch zoom this is
+ * scaled with a cheap GPU transform for smooth live feedback; the pages are
+ * re-rendered crisp (transform reset) once the gesture settles. */
+.pdf-pages {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  transform-origin: top center;
+  will-change: transform;
+}
+
+.pdf-page {
+  position: relative;
+  margin: 0 auto;
+  box-shadow: 0 1px 4px rgb(0 0 0 / 0.18);
+  background: #fff;
+}
+
+.pdf-page canvas {
+  display: block;
+}
+
+.textLayer {
+  position: absolute;
+  text-align: initial;
+  inset: 0;
+  overflow: clip;
+  opacity: 1;
+  line-height: 1;
+  letter-spacing: normal;
+  word-spacing: normal;
+  text-size-adjust: none;
+  forced-color-adjust: none;
+  transform-origin: 0 0;
+  caret-color: CanvasText;
+  z-index: 1;
+
+  --min-font-size: 1;
+  --text-scale-factor: calc(var(--total-scale-factor) * var(--min-font-size));
+  --min-font-size-inv: calc(1 / var(--min-font-size));
+}
+
+.textLayer :is(span, br) {
+  color: transparent;
+  position: absolute;
+  white-space: pre;
+  cursor: text;
+  transform-origin: 0% 0%;
+  user-select: text;
+}
+
+.textLayer > :not(.markedContent),
+.textLayer .markedContent span:not(.markedContent) {
+  z-index: 1;
+  --font-height: 0;
+  font-size: calc(var(--text-scale-factor) * var(--font-height));
+  --scale-x: 1;
+  --rotate: 0deg;
+  transform: rotate(var(--rotate)) scaleX(var(--scale-x))
+    scale(var(--min-font-size-inv));
+}
+
+.textLayer .markedContent {
+  display: contents;
+}
+
+.textLayer span[role="img"] {
+  user-select: none;
+  cursor: default;
+}
+
+/* Visible drag highlight. (The shipped viewer paints transparent here because
+ * it renders its own highlight overlay, which we don't use.) */
+.textLayer ::selection {
+  background: rgb(59 130 246 / 0.4);
+}
+
+.textLayer br::selection {
+  background: transparent;
+}
+
+.textLayer .endOfContent {
+  display: block;
+  position: absolute;
+  inset: 100% 0 0;
+  z-index: 0;
+  cursor: default;
+  user-select: none;
+}
+
+.textLayer.selecting .endOfContent {
+  top: 0;
+}

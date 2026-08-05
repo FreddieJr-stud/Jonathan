@@ -1,0 +1,10 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "preview-key-forward",
+  "description": "Lets the otherwise IPC-less preview child webviews forward host keyboard shortcuts to the app. Grants event EMIT only (no command access), scoped to remote http(s) pages loaded in preview-* webviews, so a previewed page can at most spoof a shortcut event and never reach any Tauri command, the filesystem, or the shell.",
+  "webviews": ["preview-*"],
+  "remote": {
+    "urls": ["http://*", "https://*"]
+  },
+  "permissions": ["core:event:allow-emit"]
+}
