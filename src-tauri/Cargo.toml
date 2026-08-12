@@ -60,7 +60,7 @@ tokio = { version = "1", default-features = false, features = [
 	# park a runtime worker thread and perturb the very race being tested.
 	"time",
 ] }
-tokio-tungstenite = "0.24"
+tokio-tungstenite = "0.30"
 tempfile = "3"
 notify = "8.2.0"
 
