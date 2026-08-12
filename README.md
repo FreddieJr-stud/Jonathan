@@ -2,27 +2,63 @@
   <img src="public/logo.png" width="144" height="144" alt="Jonathan" />
   <h1>Jonathan</h1>
 
-  <p><strong>Lightweight Terminal-first AI-native dev workspace.</strong></p>
+  <p><strong>A terminal-first, agentic dev workspace built on Tauri + Rust + React.</strong></p>
 
   <p>
-    <img src="https://img.shields.io/github/v/release/crynta/terax-ai?label=version&color=blue" alt="version" />
-    <img src="https://img.shields.io/github/downloads/crynta/terax-ai/total?label=downloads&color=blue" alt="downloads" />
-    <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey" alt="platform" />
-    <a href="https://discord.gg/tyveTUyEp7"><img src="https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white" alt="Discord" /></a>
-  </p>
-
-  <p>
-    <a href="https://terax.app">Website</a>
-    ·
-    <a href="https://terax.app/docs">Docs</a>
-    ·
-    <a href="https://github.com/crynta/Jonathan-website">Website's source code</a>
+    <img src="https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-lightgrey" alt="platform" />
+    <img src="https://img.shields.io/badge/license-Apache--2.0-blue" alt="license" />
   </p>
 </div>
 
 ---
 
-Jonathan is a lightweight open-source terminal (ADE) built on Tauri 2 + Rust and React 19. A native PTY backend with a WebGL renderer, an agentic AI side-panel that runs against your own keys or fully local models, plus a code editor, file explorer, source control with a git graph, and a web preview pane built in. About 7-8 MB on disk. No telemetry. No account.
+Personal project. A native PTY-backed terminal with a code editor, git source control, file explorer, and an agentic AI side-panel — built from scratch (Tauri 2 + Rust backend, Vite + React 19 frontend), not a fork.
+
+## What it does that most terminal apps don't
+
+- **A CI-enforced startup-bundle budget, not a one-time Lighthouse screenshot.** `eager-budget.test.ts` statically traces the import graph of every window entry point and fails the build if a heavy dependency (`@ai-sdk`, `streamdown`, `@codemirror`, `@uiw`) ever gets pulled into the eager/startup bundle. Most apps measure bundle size after the fact and hope it doesn't regress; this one makes a regression a failing test.
+- **A secrets backend that's honest about platform differences instead of assuming one keyring model everywhere.** macOS and Windows use the native OS keychain via the `keyring` crate. Linux is handled separately and deliberately: the default Secret Service (D-Bus) backend silently fails on systems without `gnome-keyring`/`kwallet` running — a common case for an AppImage/deb/rpm desktop app — so Linux falls back to a `0600`-permission file in the app's local data dir, written atomically (write-to-temp, then rename). Same approach Chromium/Brave use in the same situation, documented in-code with the reasoning, not just implemented silently.
+
+## Architecture
+
+```mermaid
+flowchart TB
+    subgraph Frontend["Frontend — Vite + React 19 + TypeScript"]
+        Term["Terminal panel<br/>xterm.js + WebGL renderer"]
+        Editor["Code editor<br/>CodeMirror 6 + vim mode"]
+        Git["Source control panel<br/>commit graph, stage/unstage"]
+        Explorer["File explorer"]
+        AI["AI side-panel<br/>agentic tool calls, plan mode"]
+    end
+
+    subgraph Backend["Backend — Tauri 2 + Rust (src-tauri/)"]
+        PTY["pty::job<br/>PTY lifecycle mgmt"]
+        Proc["proc<br/>process spawning"]
+        Shell["shell::background<br/>+ ringbuffer"]
+        FS["fs::file / tree / search / mutate"]
+        GitMod["git::commands / parser"]
+        Secrets["secrets<br/>Keychain (macOS/Win)<br/>0600 file fallback (Linux)"]
+    end
+
+    subgraph External["External"]
+        OS["OS shell<br/>bash/zsh/pwsh/cmd"]
+        Providers["AI providers<br/>OpenAI · Anthropic · Google · xAI<br/>Cerebras · Groq · DeepSeek · Mistral<br/>OpenRouter · LM Studio · MLX (local)"]
+        Keychain["OS Keychain / Secret Service"]
+    end
+
+    Term <-->|Tauri IPC| PTY
+    Editor <-->|Tauri IPC| FS
+    Git <-->|Tauri IPC| GitMod
+    Explorer <-->|Tauri IPC| FS
+    AI <-->|Tauri IPC| Secrets
+    AI -->|API calls, key resolved via Secrets| Providers
+
+    PTY --> Proc --> OS
+    Shell --> Proc
+    Secrets --> Keychain
+
+    CI["eager-budget.test.ts<br/>(build-time gate)"] -.->|blocks eager import of<br/>AI/editor/markdown stacks| Frontend
+```
 
 ## Screenshots
 
@@ -43,77 +79,31 @@ Jonathan is a lightweight open-source terminal (ADE) built on Tauri 2 + Rust and
 ## Features
 
 ### Terminal
-
 - xterm.js with WebGL renderer, multi-tab with background streaming
-- GPU-accelerated block-based terminal with editor-like command input
-- Native PTY backend via `portable-pty` (zsh, bash, pwsh, fish, cmd)
+- Native PTY backend (Rust, `src-tauri/src/modules/pty/`)
 - Split panels (horizontal and vertical)
-- Inline search, link detection, true-color
-- Per-tab workspace environments on Windows (Local, or any installed WSL distro)
 
 ### Code editor
-
-- CodeMirror 6 (supports all popular languages - TS/JS, Rust, Python, Go, C/C++, Java, HTML/CSS, JSON, Markdown, etc.)
-- Inline AI autocomplete with local model support
-- AI edit diffs, accept or reject hunk by hunk
-- Vim mode
-- Ten built-in editor themes: Atom One, Aura, Copilot, GitHub Dark / Light, Gruvbox Dark, Nord, Tokyo Night, Xcode Dark / Light
+- CodeMirror 6 — TS/JS, Rust, Python, Go, C/C++, Java, HTML/CSS, JSON, Markdown, and more
+- Vim mode (`src/modules/editor/lib/vim.ts`)
+- Multiple built-in themes, including Gruvbox, Nord, and Tokyo Night
 
 ### Source control
-
-- Stage / unstage hunks, commit (Cmd+Enter / Ctrl+Enter), push with upstream awareness
-- Branch display including detached HEAD state
-- Git history pane with a real commit graph (lane rendering for merges and branches)
-- Commit search and filter, click through to the remote commit page
+- Stage / unstage hunks, commit, push
+- Git history pane with a real commit graph (Rust-side parsing in `src-tauri/src/modules/git/`)
 
 ### File explorer
-
-- Catppuccin icon theme
-- Fuzzy search, keyboard navigation, inline rename, context actions
+- Fuzzy search, keyboard navigation, inline rename
 - Attach files and selections directly to the AI side-panel
 
 ### Web preview
-
-- Auto-detects local dev servers and opens them in a preview tab
-- External URL preview via a native child webview
-
-### Themes and customization
-
-- Custom themes built in-app, switch between bundled presets and your own
-- Create your own themes, share them or import from the community
-- Background images with adjustable opacity and blur
-- Editor theme is independent from the app theme
+- Auto-detects local dev servers from terminal output and opens them in a preview tab
 
 ### AI
-
-- **BYOK providers:** OpenAI, Anthropic, Google (Gemini), Groq, xAI (Grok), Cerebras, OpenRouter, DeepSeek, Mistral, plus any OpenAI-compatible endpoint
-- **Local / offline:** LM Studio, MLX, Ollama
-- **Agentic workflow:** plans, sub-agents, project memory via `TERAX.md`, file read / write / edit / multi-edit / grep / glob, bash with approval gating, background processes
-- **Composer:** snippets via `#handle`, files via `@path`, slash commands, voice input, attach-to-agent from explorer or selection
-- **Custom agents** with their own system prompt and tool subset
-- **Plan mode** for multi-step work, generates and confirms before doing
-
-## Install
-
-Latest installers are on the [Releases](https://github.com/crynta/terax-ai/releases/latest) page. Jonathan auto-updates from there.
-
-### Windows notes
-
-- On first launch Windows shows "Windows protected your PC" because Jonathan isn't code-signed yet. Click **More info** then **Run anyway**.
-- Default shell detection: `pwsh.exe` (PowerShell 7+) -> `powershell.exe` (Windows PowerShell 5.1) -> `cmd.exe`.
-- WSL is a first-class workspace environment, not a wrapped subprocess.
-
-### Linux notes
-
-- **Arch / AUR:** `yay -S terax-bin` (or `paru`, etc.). Tracks the latest release.
-- **NixOS / Nix**: use the official flake — `nix profile install github:crynta/terax-ai` (non-NixOS), or import the flake and add `inputs.terax.packages.${pkgs.system}.terax` to `environment.systemPackages` (NixOS). The `nixosModules.terax` output is also available for a simpler setup.
-- **AppImage:** needs FUSE. Without it: `./Jonathan_*.AppImage --appimage-extract-and-run`. On Wayland with rendering glitches, try `WEBKIT_DISABLE_DMABUF_RENDERER=1`. Otherwise the `.deb` / `.rpm` packages link against the system GTK stack and tend to be smoother.
-
-## Configure AI
-
-1. Open **Settings -> AI**.
-2. Pick a provider and paste your API key. For local inference, point Jonathan at your LM Studio / MLX / Ollama endpoint.
-3. Keys are written to the OS keychain via `keyring`. They never touch disk or localStorage.
+- **BYOK providers:** OpenAI, Anthropic, Google (Gemini), xAI, Cerebras, Groq, DeepSeek, Mistral, OpenRouter, or any OpenAI-compatible endpoint
+- **Local:** LM Studio, MLX
+- Agentic workflow: plans, tool calls (file read/write/edit/grep/glob, shell with approval gating, background processes)
+- Keys are written to the OS keychain via `keyring` (macOS/Windows) or a `0600` local file (Linux) — see Architecture above
 
 ## Build from source
 
@@ -140,22 +130,6 @@ cd src-tauri && cargo test --locked                               # Rust tests
 
 Tauri 2, Rust, `portable-pty`, React 19, TypeScript, Vite, xterm.js, CodeMirror 6, Vercel AI SDK v6, Tailwind v4, shadcn/ui, Zustand.
 
-## Contributing
-
-Issues and PRs are welcome! Feel free to open issues, suggest features, or submit pull requests. See [CONTRIBUTING.md](CONTRIBUTING.md) for more details.
-
 ## License
 
-Jonathan is licensed under the Apache-2.0 License. For more information on our dependencies, see [Apache License 2.0](LICENSE).
-
-## Star history
-
-<div align="center">
-  <a href="https://www.star-history.com/#crynta/terax-ai&Date">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=crynta/terax-ai&type=Date&theme=dark" />
-      <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=crynta/terax-ai&type=Date" />
-      <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=crynta/terax-ai&type=Date" />
-    </picture>
-  </a>
-</div>
+Apache-2.0 — see [LICENSE](LICENSE).
