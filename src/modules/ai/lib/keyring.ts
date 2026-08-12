@@ -90,18 +90,11 @@ export function hasAnyKey(keys: ProviderKeys): boolean {
   return PROVIDERS.some((p) => providerSupportsKey(p.id) && !!keys[p.id]);
 }
 
-/** Hardcoded OpenRouter key so the app ships working out-of-the-box on the
- *  OpenRouter free tier. Single-user build — intentionally baked in. An env
- *  override (`.env.local`) or a key entered in Settings still wins. */
-const HARDCODED_OPENROUTER_KEY =
-  "REDACTED_OPENROUTER_KEY";
-
 /** Provider keys seeded into the keyring at startup when their slot is empty.
- *  A user-entered key always wins — we only seed when nothing is stored. */
+ *  A user-entered key always wins — we only seed when nothing is stored.
+ *  Set `VITE_OPENROUTER_API_KEY` in `.env.local` (gitignored) for local dev. */
 const ENV_SEED_KEYS: Partial<Record<ProviderId, string | undefined>> = {
-  openrouter:
-    (import.meta.env.VITE_OPENROUTER_API_KEY as string | undefined) ||
-    HARDCODED_OPENROUTER_KEY,
+  openrouter: import.meta.env.VITE_OPENROUTER_API_KEY as string | undefined,
 };
 
 /** Seed any configured env keys into the keyring when their slot is empty.
